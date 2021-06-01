@@ -51,6 +51,8 @@ It is located on the SSD
 
 The scripts used are on www.gitlab.com/tayoso2/pdas_mapping. 
 
+**Apologies for the poorly written scripts as there was no time to tidy them up after project closure.**
+
 ### Proxy mains
 
 **Attribution**
