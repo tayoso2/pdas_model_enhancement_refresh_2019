@@ -4,6 +4,8 @@
 
 The scope of this project intended to give a like-for-like comparison with PR19 PDaS model results (EDA). 
 
+The task was to generate a Private Drains and Sewer (PDaS) Model based on the concept of flooding and collapse, and predict the number of blockages over time. This included extensive STW survey analysis which updated the current thinking of the expert opinion (PR19) PDaS model with a data driven approach. This updated asset model will assist in the development of their long term Asset Analytics Strategy. 
+
 
 
 ## Resources
