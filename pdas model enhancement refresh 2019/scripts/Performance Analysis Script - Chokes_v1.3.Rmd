@@ -1,0 +1,822 @@
+---
+title: "Chokes Analysis Report"
+output:
+    html_document:
+      theme: yeti
+      toc: true
+      number_sections: true
+      toc_float: 
+        collapsed: false
+        smooth_scroll: true
+---
+
+```{r header, echo=FALSE,message=FALSE, warning = FALSE, results = 'hide'}
+#BeginHeader
+#Input#Constant#Name:Years of data to use#Description: Minimum year of event data to use
+#Input#Constant#Name:Start year#Description: Start year of the model
+#Input#Constant#Name:Graph Map#Description: TRUE or FALSE to turn on maps
+#Input#DataTable#Name:Processed Assets#Description: Processed asset base
+#Input#DataTable#Name:Event Data#Description: Events data
+#Input#DataTable#Name:Material Relationships#Description: Material groupings for age relationships
+#Input#DataTable#Name:Calibration Bands#Description: Bands to be applied to calibration 
+#Input#DataTable#Name:Calibration Rules#Description: Rules to be applied to calibration
+#Output#DataTable#Name:Choke Diameter Relationships#Description: Diameter relationships for use in the model
+#Output#DataTable#Name:Choke Age Relationships#Description: Age relationships for use in the model
+#Output#DataTable#Name: Processed Assets#Description: Updated processed assets
+#Output#DataTable#Name: Choke Calibration#Description: Calibration table for use in the model
+#EndHeader
+```
+
+```{r import, echo=FALSE,message=FALSE, warning = FALSE, results = 'hide'}
+# Install Packages
+library(tidyverse)
+library(sf)
+library(tmap)
+library(data.table)
+library(gridExtra)
+library(modelr)
+library(scales)
+library(lubridate)
+library(mltools)
+
+rm(list=ls())
+
+# If running script offline set to TRUE. If in EDA set to FALSE
+offline <- TRUE
+
+# Load in Files
+if(offline == TRUE){
+  args <- c("", 
+            #numeric inputs
+            1900,
+            2017,
+            "FALSE", #Input to turn graphs off
+            #file inputs
+            "Inputs/Processed Assets.csv", #asset base
+            "Inputs/Failure data for AECOM.csv", #failure data
+            "Inputs/Material_Relationships.csv", #material groupings for age relationships
+            "Inputs/Calibration Bands.csv",
+            "Inputs/Calibration Rules.csv",
+            #
+            "Outputs/Diameter Analysis.csv", #Diameter output
+            "Outputs/Age Relationships.csv", #Age relationship output 
+            "Outputs/Processed Assets.csv", #Outputs of asset file with cohort/cg/blockages added 
+            "Outputs/Blockage Calibration.csv"
+            
+            )
+}else{
+  args <- commandArgs(trailingOnly = TRUE)
+  setwd(args[1])
+}
+
+years.of.data.to.use <- as.numeric(args[2])
+Start.Year <- as.numeric(args[3])
+show.maps <- args[4]
+
+assets <- read_csv(args[5])
+events <- read.csv(args[6])
+material.relationships <- read.csv(args[7])
+calibration.bands <- data.table(read_csv(args[8]))
+calibration.rules <- read_csv(args[9])
+
+```
+
+
+```{r format data, echo=FALSE,message=FALSE, warning = FALSE, results = 'hide'}
+
+#Basic Asset Data formatting
+assets.events <- assets %>%
+  mutate(AssetAge = Start.Year - Final.Yearlaid) %>%
+  select(ASSET_ID,
+         Area = Final.District.Cohort, 
+         Banded_Material = Final.Material.Cohort, 
+         Banded_SoilType = Surface,
+         Banded_Diameter = Final.Diameter.Cohort,
+         Banded_Yearlaid = Final.Yearlaid.Cohort,
+         Final.Yearlaid,
+         AssetAge, 
+         Length, 
+         WKT) %>%
+  mutate(
+       SoilType = Banded_SoilType)
+
+#Basic event data formatting
+events <- events %>%
+  filter(Performance.data == "Blockage") %>%
+  mutate(
+    DATE = dmy(Date.of.failure),
+    DateYear = year(DATE)
+    ) %>% 
+  select(
+    ID = Job.ID,
+    DATE,
+    ASSET_ID = Facility.code,
+    MATERIAL = Material,
+    DIAMETER = Diameter,
+    DateYear) %>%
+  filter(DateYear>=years.of.data.to.use)
+
+#link event data to assets and work out failure age
+events <- events %>%
+  left_join(assets.events, by = "ASSET_ID") %>%
+  mutate(EventAge = DateYear - Final.Yearlaid) %>%
+  filter(EventAge >0) #filter out events that occur after the asset was laid
+  
+#calculate number of years data
+years.of.data <- as.integer(max(events$DATE) - min(events$DATE))/365
+
+```
+
+
+```{r create tables for modelling, echo=FALSE,message=FALSE, warning = FALSE, results = 'hide'}
+
+#summary of event ages
+assets.ages <- events %>%
+  select(Notification.Date = DATE, Banded_Material, AssetAge = AssetAge)
+
+#summary of asset diameters
+assets.diameters <- events %>%
+  select(DateYear, 
+         Area, 
+         Banded_Material, 
+         Banded_SoilType,
+         Banded_Diameter) %>%
+  mutate(
+    SoilType =  Banded_SoilType
+  )
+
+```
+
+***
+
+# Method
+
+The Chokes Model predicts the number of chokes over time. This is achieved via the derivation of relationships for each material type within the asset base. The model uses a diameter failure rate (events/km/yr) and Age (a dimensionless multiplier (percent of events/percent of length)).
+
+The diameter relationships are expressed as a rate of failure, i.e. events/km/yr. This is achieved by grouping pipes by material with like diameters (by surface type) together, and calculating the number of events that have occurred per km on each group.
+
+The age relationship is calculated as a multiplying factor. Similar average ages (bands) are grouped, and the % length and % events calculated. The factor for each age band is calculated as the % events divided by the % length, thus creating a dimensionless ageing factor.
+
+Each relationship is derived using company specific data. To calculate the number of blockages for a given asset cohort, EDA performs the following calculation:
+ 
+$$B_a(t_0)_i =  R_i F_i L_i$$
+
+where $i$ is a series of all pipe groups
+
+* $B_a(t_0)_i$ is the characteristic event rate at time t0 based on accounted for variables (events/yr)
+* $R_i$ is the event rate corresponding to the pipe's material, surface and diameter (events/km/yr)
+* $F_i$ is the modification factor corresponding to age (dimensionless)
+* $L_i$ is the asset length (km)
+
+Therefore, as a cohort's age changes through time so does the number of chokes associated with it based on the above equation. 
+
+***
+
+# Diameter Analysis
+
+The diameter relationships are expressed as a rate of failure, i.e. events/km/yr. This is achieved by grouping pipes by material with like diameters (by surface) together, and calculating the number of events that have occurred per km on each group.
+
+The charts below summarises the results of the choke analysis by material. In general, the pipes showed a reducing failure rate with increasing diameter.
+
+The following surface Types are used:
+
+* **Path**
+* **Road**
+* **Verge**
+
+```{r echo=FALSE,message=FALSE, warning = FALSE, results = 'hide'}
+
+# Process the raw data
+# Diameter Data
+diameter.by.events <- assets.diameters %>% 
+  count(Banded_Material, 
+           SoilType, 
+           Banded_SoilType,
+           Banded_Diameter) %>%
+  rename(events = n)# %>%
+#  mutate(Original_Diameter = Banded_Diameter)
+
+# Age Data
+ages.by.events <- assets.ages %>%
+  count(Banded_Material,
+        AssetAge) %>%
+  rename(events = n)
+
+# Asset Data
+assets.by.length <- assets.events  %>%
+  group_by(Banded_Material,
+           SoilType,
+           Banded_SoilType,
+           Banded_Diameter,
+           AssetAge) %>%
+  summarise(Length = sum(Length))
+```
+
+```{r echo=FALSE,message=FALSE, warning = FALSE}
+
+# Sum up the events and take the average diameter by the Diameter Bands
+diameter.by.events <- assets.diameters %>%
+  group_by(Banded_Diameter,
+           Banded_Material,
+           SoilType) %>%
+  summarise(Events = n(),
+            PlotDiameter = mean(Banded_Diameter))
+
+# Sum up length by the diameter bands
+assets.by.length.diameter <- assets.by.length %>%
+  group_by(Banded_Diameter,
+           Banded_Material,
+           SoilType) %>%
+  summarise(Length = sum(Length))
+
+# Join the length and event data and calcaulte the event rate by dividing
+# events by length and duration of data
+diameter.analysis <- left_join(assets.by.length.diameter ,
+                               diameter.by.events,
+                               by = c("Banded_Material", 
+                                      "SoilType", 
+                                      "Banded_Diameter")) %>%
+  mutate(EventRate = Events/(Length/1000)/years.of.data) 
+
+#Apply rule that pecent of length allowed is 5%
+length.by.material <- diameter.analysis %>%
+    group_by(Banded_Material,
+             SoilType) %>%
+  summarise(Total.Length = sum(Length))
+
+diameter.analysis <- diameter.analysis %>%
+  left_join(length.by.material) %>%
+  mutate(Percent.Length = round((Length/Total.Length)*100))
+
+diameter.analysis.roll <- diameter.analysis %>%
+  filter(Percent.Length >= 4) %>%
+  select(Roll = Banded_Diameter, Banded_Material, SoilType) %>%
+  mutate(DiameterBands = Roll)
+ 
+diameter.analysis.roll <- data.table(diameter.analysis.roll)
+diameter.analysis <- data.table(diameter.analysis)
+
+  #perform rolling join
+  setkey(diameter.analysis.roll, Banded_Material, SoilType, Roll)
+  setkey(diameter.analysis, Banded_Material, SoilType, Banded_Diameter)
+  diameter.analysis  <- diameter.analysis.roll[diameter.analysis, roll = -Inf]
+
+#Work out max of of roll
+diameter.analysis.roll <- diameter.analysis.roll %>%
+  group_by(Banded_Material, SoilType) %>%
+  summarise(MaxDiameter = max(Roll))
+  
+diameter.analysis <- diameter.analysis %>%
+  left_join(diameter.analysis.roll)
+  
+diameter.analysis$DiameterBands <- ifelse( is.na(diameter.analysis$DiameterBands) == T, diameter.analysis$MaxDiameter,  diameter.analysis$DiameterBands)
+
+#make zeros 0 so canbe summed
+diameter.analysis[is.na(diameter.analysis)] <- 0 
+
+diameter.analysis <- diameter.analysis %>%
+  group_by(Banded_Material, SoilType, DiameterBands) %>%
+  summarise(Events = sum(Events), Length = sum(Length))  %>%
+  mutate(EventRate = Events/(Length/1000)/years.of.data, PlotDiameter = DiameterBands) 
+
+```
+
+```{r echo=FALSE, fig.height=11, fig.width=9, message=FALSE, warning=FALSE, results='hide'}
+# Create plotting function
+DiameterPlot <- function(data){
+  # Take the diameter analysis table by material and plots a diameter plot
+  #
+  # data - list of data frames by material of the diameter analysis table
+  
+  plot <- ggplot(data) + 
+  geom_point(aes(x = DiameterBands, y = EventRate, col = SoilType)) +
+  geom_line(aes(x = DiameterBands, y = EventRate, col = SoilType)) + 
+      labs(title = unique(data$Banded_Material),
+           subtitle = "Event Rate by Diameter and Surface Type",
+           y = "Event Rate (events/km/year)",
+           x = "Diameter") +
+    ylim(c(0, 1.2)) + 
+    theme(legend.position="bottom") +
+    theme(legend.title = element_blank())
+    
+  return(plot)
+}
+
+#perform group by on assets
+asset.groups <- data.table(assets.events %>%
+  group_by(Banded_Material, SoilType, Banded_Diameter) %>%
+  select(
+    Banded_Material, SoilType, 
+    DiameterBands = Banded_Diameter
+  ) %>%
+  summarise())
+
+#make both datatables for rolling join
+diameter.analysis <- data.table(diameter.analysis)
+
+#create link for rolling join
+setkey(asset.groups, Banded_Material, SoilType, DiameterBands)
+setkey(diameter.analysis, Banded_Material, SoilType, DiameterBands)
+
+#roll join over all available diameters
+diameter.analysis  <- diameter.analysis[asset.groups, roll = "nearest"]
+
+
+# Split the diameter analysis data.frame by material to make the plots
+diameter.analysis.list <- split(diameter.analysis,
+                           diameter.analysis$Banded_Material)
+
+diameter.analysis <- diameter.analysis %>%
+  select(Banded_Material, SoilType, DiameterBands, EventRate)
+
+# Set theme of plots
+theme_set(theme_bw())
+
+# Run the plotting function
+plots.diameter <- lapply(diameter.analysis.list, DiameterPlot)
+do.call(grid.arrange, c(plots.diameter, ncol=2))
+
+```
+
+***
+
+# Age Analysis
+
+The age relationship is calculated as a multiplying factor. Similar average ages (bands) are grouped, and the percent of length and percent of events calculated. The factor for each age band is calculated as the % events divided by the % length, thus creating a dimensionless ageing factor.
+
+Where no age relationship has been determined, this equates to zero deterioration. 
+
+Below is the age relationships for each material:
+
+
+```{r echo=FALSE,message=FALSE, warning = FALSE}
+# Create Age Relationships
+
+# Set number of age bands
+age.bands <- 9
+
+# Set age band split
+cir.ci.threshold <- 78
+
+# Add age threshold to event data
+ages.by.events <- ages.by.events %>%
+  mutate(AgeThreshold = ifelse((Banded_Material == 'CI' | Banded_Material == 'CIR'), 
+                               ifelse((AssetAge > cir.ci.threshold),
+                                        'Pre 1940', 
+                                        'Post 1940'),
+                               'No Age Split')) %>%
+  mutate(RoundAge = round(AssetAge)) %>%
+  group_by(Banded_Material, AgeThreshold, RoundAge) %>%
+  summarise(events = sum(events)) %>%
+  filter(RoundAge>0)
+         
+# Add age threshold onto the length data                 
+assets.by.length <- assets.by.length %>%
+  mutate(AgeThreshold = ifelse((Banded_Material == 'CI' | Banded_Material == 'CIR'), 
+                               ifelse((AssetAge > cir.ci.threshold),
+                                        'Pre 1940', 
+                                        'Post 1940'),
+                               'No Age Split')) %>%
+  mutate(RoundAge = round(AssetAge)) %>%
+  group_by(Banded_Material, AgeThreshold, RoundAge) %>%
+  summarise(Length = sum(Length))
+
+# Do a full join between the event and length data by Material, Age Threshold and Rounded Age
+age.analysis <- full_join(ages.by.events, 
+                          assets.by.length,
+                          by = c("Banded_Material",
+                                 "AgeThreshold",
+                                 "RoundAge"))
+
+age.analysis[is.na(age.analysis)] <- 0
+age.analysis$Rate <- as.integer(age.analysis$Length)
+
+
+age.analysis$Rate <- ifelse(age.analysis$Length == 0, 0, round(age.analysis$events/(as.integer(age.analysis$Length)/1000)/years.of.data,4) )
+
+# Split the age analysis data.frame into a list by material and age threshold
+age.analysis.list <- split(age.analysis,
+                           paste0(age.analysis$Banded_Material,
+                                  age.analysis$AgeThreshold))
+
+CalculateAgeBands <- function(data, age.bands){
+
+  data <- data %>%
+    mutate(PercentLength = Length/sum(data$Length)*100) %>%
+    arrange(RoundAge)
+
+  data$CumPercentLength <- as.numeric(cumsum(data$PercentLength ))
+  
+  number.bins <- rep(max(data$CumPercentLength)/age.bands, each = age.bands) * 1:9
+  
+  data[, "bin"] <- bin_data(data$CumPercentLength, bins=c(-Inf, number.bins), binType = "explicit")
+  
+  data <- data %>%
+    group_by(bin, Banded_Material, AgeThreshold) %>%
+    mutate(Weight = RoundAge * Length) %>%
+    summarise(Length = sum(Length), 
+              events = sum(events), 
+              WeightedAge = sum(Weight)/sum(Length), 
+              PercentofEvents = events / sum(data$events),
+              PercentofLength = Length / sum(data$Length),
+              EventFactor = PercentofEvents/PercentofLength,
+              Rate = events/(Length/1000)/years.of.data) %>%
+      select(Banded_Material,
+             AgeThreshold,
+             WeightedAge,
+             PercentofEvents,
+             PercentofLength,
+             EventFactor) %>%
+      ungroup() %>%
+      select(-bin) %>%
+      arrange(WeightedAge)
+  
+}
+
+#  Apply the Age Bands function over the age analysis list
+age.analysis.list <- lapply(age.analysis.list, CalculateAgeBands, age.bands)
+
+# Collate back the list of data.frames back into one data.frame
+age.analysis <- rbindlist(age.analysis.list)
+
+
+```
+
+```{r echo=FALSE,message=FALSE, warning = FALSE,fig.height=20, fig.width=9}
+
+# Age Plotting - Split the plots by material
+age.analysis.plot <- split(age.analysis,
+                           age.analysis$Banded_Material)
+
+# Create plotting function
+AgePlot <- function(data){
+  # Take the diameter analysis table by material and plots a diameter plot
+  #
+  # data - list of data frames by material of the diameter analysis table
+  plot <- ggplot(data, aes(x = WeightedAge,
+                  y = EventFactor)) + 
+  geom_jitter(aes(col = AgeThreshold,
+                  size = PercentofEvents)) +
+    geom_smooth(aes(weight = PercentofEvents,
+                    col = AgeThreshold),
+                method = "lm") + 
+      labs(title = unique(data$Banded_Material),
+           subtitle = "Deterioration Relationship",
+           y = "Event Factor",
+           x = "Age") +
+    ylim(c(0, max(data$EventFactor) + 0.2 )) + 
+    xlim(c(0, 80)) + 
+    theme(legend.position = "none")
+  
+  return(plot)
+}
+
+LinearModel <- function(data){
+  # Calculates a Linear regression model on the data
+  #
+  # data - The data frame used to create a linear model
+  #browser()  
+  
+  model <- lm(data$EventFactor~data$WeightedAge, 
+              weights = data$PercentofEvents)
+  A_Est<-as.numeric(summary(model)$coeff[1,1])
+	B_Est<-as.numeric(summary(model)$coeff[2,1])
+	output <- data.frame(Banded_Material = unique(data$Banded_Material),
+	                     m = ifelse(B_Est < 0, 0, B_Est),
+	                     c = ifelse(B_Est < 0, 1, A_Est))
+	return(output)
+}
+
+# Run the plotting function
+plots.age <- lapply(age.analysis.plot, AgePlot)
+
+#link age analysis to material relationships
+#the purpose of this table is to identify which relationships to drop from the linear process
+age.analysis <- age.analysis %>%
+  left_join(material.relationships) %>%
+  filter(Use == Banded_Material)
+
+age.analysis.plot <- split(age.analysis,
+                           age.analysis$Banded_Material)
+
+linear.models <- rbindlist(lapply(age.analysis.plot, LinearModel))
+
+#Apply material relationships based on banding
+linear.models <- material.relationships %>%
+  left_join(linear.models, by = c("Use" = "Banded_Material")) 
+  
+do.call(grid.arrange, c(plots.age , ncol=1))
+
+```
+
+***
+
+# Summary and QA
+
+This section presents the results of the analysis in terms of: 
+
+* **Predicted over Actual** - How accurate are the total predictions against the actual data.
+* **RMSE** - How accurate are the predictions against the actual data on individual pipes.
+* **Calibration** - What calibration has been applied to account for variables not picked up in the predictive modelling.
+
+## Predicted over Actual
+
+Predicted over actual is the actual or real values divided by predicted or forecast value. In general, a prediction over actual value closer to 1 is better.
+
+```{r add required data to assets for summary, echo=FALSE,message=FALSE, warning = FALSE}
+
+#Create summary of events by pipe
+events.by.pipe <- events %>%
+  group_by(ASSET_ID) %>%
+  summarise(Events =  n()/years.of.data) %>%
+  ungroup()
+
+names(events.by.pipe)[2] <- "Actual Events"
+
+#link to main asset dataset
+assets.events  <- assets.events %>%
+  left_join(events.by.pipe, by = "ASSET_ID")
+
+#remove all NA values in actual events column
+assets.events$`Actual Events`[is.na(assets.events$`Actual Events`)] <- 0
+
+```
+
+```{r functions to apply predictions, echo=FALSE,message=FALSE, warning = FALSE}
+
+PredictEvents <- function(data, diameter.rates, age.relationships){
+  # Predicts bursts for the data based off diameter rates and age relationships
+  #
+  # data - The data which bursts should be predicted on
+  # diameter.rates - Diameter rates calcualted by Material and Soil
+  # age.relationships - Linear relationships calculated by Material and Year Threshold
+
+  data <- data %>%
+    left_join(diameter.rates, by = c("Banded_Material"= "Banded_Material", "SoilType" = "SoilType", "Banded_Diameter" = "DiameterBands")) %>%
+    left_join(age.relationships,
+              data,
+              by = c('Banded_Material')) %>%
+    mutate(Events = (((m*(AssetAge)))+c)* EventRate * (Length/1000))
+  
+  return(data)
+}
+
+#format all numbers in models to match with EDA and be 9dp
+linear.models$m <- round(linear.models$m, 9)
+linear.models$c <- round(linear.models$c, 9)
+diameter.analysis$EventRate <- round(diameter.analysis$EventRate, 9)
+
+#Create file for predicting bursts
+assets.events <- PredictEvents(assets.events,
+                        diameter.analysis,
+                        linear.models) %>%
+  mutate(`Event Rate` = Events/(Length/1000))
+
+
+```
+
+
+```{r echo=FALSE,message=FALSE, warning = FALSE}
+# Sum up the predicted bursts by area.
+# function.
+rmse.analysis <- assets.events %>%
+  group_by(Area) %>%
+  summarise(`Predicted Events` = round(sum(Events, na.rm=TRUE),2),
+            `Actual Events` = round(sum(`Actual Events`),2))
+
+# Plot the predicted vs actual chart with table
+ggplot(melt(rmse.analysis),
+       aes(Area, 
+           value,
+           fill = variable)) + 
+  geom_bar(position = 'dodge', stat = 'identity') + 
+  geom_text(aes(label=value),
+            position=position_dodge(width=0.9), 
+            vjust=-0.25) +
+   guides(fill=guide_legend(title=" ")) +
+  theme(legend.position="bottom") +
+  labs(title = 'Predicted vs Actual',
+           subtitle = "by Area",
+           y = "Events") +
+  ylim(c(0, (max(rmse.analysis[,2:3])*1.1)))
+
+rmse.analysis <- rmse.analysis %>%
+ mutate(`Predicted Over Actual` = round(`Predicted Events` / `Actual Events`,3))
+
+library(knitr)
+kable(rmse.analysis, align = 'c')
+
+```
+
+## RMSE
+
+RMSE is the square root of the average of squared errors comparing predcited vs actual bursts. The effect of each error on RMSE is proportional to the size of the squared error; thus larger errors have a disproportionately large effect on RMSE . Consequently, RMSE is sensitive to outliers.
+
+RMSE is always non-negative, and a value of 0 would indicate a perfect fit to the data. In general, a lower RMSE is better than a higher one. 
+
+```{r echo=FALSE,message=FALSE, warning = FALSE}
+
+# Create RMSE Function
+CalculateRMSE <-function(m, o){
+  # Calculates RMSE
+  #
+  # m - Model (Fitted) Values
+  # o - Observed Values
+  sqrt(mean((m - o)^2))
+}
+
+# Calculate the RMSE by area
+rmse.analysis <- assets.events %>%
+  group_by(Area) %>%
+  summarise(RMSE =  paste(round(CalculateRMSE(Events, `Actual Events`),5), 'Events'))
+
+kable(rmse.analysis, align = 'c')
+```
+
+
+## Calibration
+
+Calibration is used to account for any variables that the predictive modelling has not been able to simulate. This is acheived by calibrating by dividing the number of predicted events by the number of actual events. To avoid over-fitting the models, rules are applied to the allowable range of calibration factors dependent on the number of events.
+
+```{r apply calibration, echo=FALSE,message=FALSE, warning = FALSE}
+
+#apply calbration bands to assets
+assets.events <- data.table(assets.events)
+calibration.bands$calibration.band <- calibration.bands$DiameterBands
+setkey(assets.events, Banded_Diameter)
+setkey(calibration.bands, DiameterBands, calibration.band)
+assets.events <- calibration.bands[assets.events, roll = -Inf]
+
+#create final calibration table
+calibration.events <- assets.events %>%
+  group_by(Area, Banded_Material, Banded_SoilType, calibration.band) %>%
+  summarise(Predicted = sum(Events) * years.of.data, Actual = sum(`Actual Events`)* years.of.data  ) %>%
+  mutate(Calibration.Factor = ifelse(Actual == 0, 1, Actual/Predicted))
+
+#add in calibration rules
+calibration.events <- data.table(calibration.events)
+#create calibration rule bins to link to asset dat
+number.bins <- c(0, as.vector( calibration.rules$max.events ))
+#add bins to asset data
+calibration.events[, "bin"] <- bin_data(calibration.events$Actual, bins=number.bins, binType = "explicit")
+#summaise bins
+calibration.rules.temp <- calibration.events %>%
+  group_by(bin) %>%
+  summarise()
+#link bins to calibration rules
+calibration.rules <- cbind(calibration.rules, calibration.rules.temp)
+#link calibration rules to calibration data
+calibration.events <- left_join(calibration.events, calibration.rules)
+#apply calibration rules
+calibration.events <- calibration.events %>%
+  mutate(Final.Calibration.Factor = ifelse(Calibration.Factor <= min.calibration, min.calibration, Calibration.Factor),
+         Final.Calibration.Factor = ifelse(Calibration.Factor >= max.calibration, max.calibration, Final.Calibration.Factor)) %>%
+  select(Area, Banded_Material, Banded_SoilType, calibration.band, Final.Calibration.Factor)
+
+#apply calibration to events and calculate Calibrated events
+assets.events <- assets.events %>%
+  left_join(calibration.events) %>%
+  mutate(Calibrated_Events = Events * Final.Calibration.Factor)
+
+#create summary table
+calibrated.summary <- assets.events %>%
+  group_by(Area) %>%
+  summarise(`Calibrated Events` = round(sum(Calibrated_Events, na.rm=TRUE),2),
+            `Actual Events` = round(sum(`Actual Events`),2))
+
+# Plot the predicted vs actual chart with table
+ggplot(melt(calibrated.summary),
+       aes(Area, 
+           value,
+           fill = variable)) + 
+  geom_bar(position = 'dodge', stat = 'identity') + 
+  geom_text(aes(label=value),
+            position=position_dodge(width=0.9), 
+            vjust=-0.25) +
+   guides(fill=guide_legend(title=" ")) +
+  theme(legend.position="bottom") +
+  labs(title = 'Calibrated vs Actual',
+           subtitle = "by Area",
+           y = "Events") +
+  ylim(c(0, (max(calibrated.summary[,2:3])*1.1)))
+
+```
+
+***
+
+# Map View
+
+Below is a heat map of the assets with the number of predicted chokes applied.
+
+```{r echo=FALSE,message=FALSE, warning = FALSE, fig.width=8}
+
+
+if(show.maps=="TRUE"){
+  
+ map.assets <- assets.events %>%
+   filter(is.na(WKT) == F) %>%
+   select(WKT, Calibrated_Events, ASSET_ID)
+ 
+ map.assets  <- st_as_sf(map.assets,
+               wkt = "WKT")
+
+# Display a map showing predicted events
+tmap_mode("view")
+qtm(map.assets, 
+    lines.col ="Calibrated_Events", 
+    text.col = "Calibrated_Events", 
+    lines.palette = "Accent",
+    lines.lwd = 2,
+    lines.breaks = c(0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.2), 
+    title = "Calibrated Events")
+
+}
+
+```
+
+```{r final script outputs, echo=FALSE,message=FALSE, warning = FALSE}
+
+#set calibrated chokes for purposes of assigning data back to asset file
+assets.events$Calibrated_Blockages <- assets.events$Calibrated_Events
+
+added.fields <- c("ASSET_ID", "Calibrated_Blockages")
+#filter assets collapses with data needed to be added to main asset file
+assets.events <- assets.events %>% 
+  select(one_of(added.fields))
+
+#in case this script has been ran twice without asset file being reran remove fields
+added.fields <- added.fields[2:20]
+assets <- assets %>% select(-one_of(added.fields))
+
+#join data back to the asset file and export
+assets <- left_join(assets, assets.events)
+
+#write files
+fwrite(assets, args[12])
+
+```
+
+```{r export model data, echo=FALSE,message=FALSE, warning = FALSE}
+
+#format diameter rates table and export
+diameter.analysis <- diameter.analysis %>%
+  select(
+    Model_Material = Banded_Material,
+    Surface = SoilType,
+    Model_Diameter = DiameterBands,
+    EventRate
+  )
+
+fwrite(diameter.analysis, args[10])
+
+#format age data table and export
+linear.models <- linear.models %>%
+  select(
+    Model_Material = Banded_Material,
+    m,
+    c
+  )
+
+fwrite(linear.models, args[11])
+
+#format calibration factors into lookup range and export
+calibration.events <- calibration.events %>%
+  select(Area, Banded_Material,
+         Surface = Banded_SoilType,
+         DiameterGroup = calibration.band,
+         EventFactor = Final.Calibration.Factor) 
+
+#format calibration events to be wide
+calibration.events <- spread(calibration.events, DiameterGroup, EventFactor)
+#set all na to 1
+calibration.events[is.na(calibration.events)] <- 1
+
+#get calibration bands and add 1 to allow for <
+calibration.bands <- calibration.bands[,1] + 1
+
+#reformat bands to wide and add 0 to start
+calibration.bands <- calibration.bands %>%
+  mutate(Start = paste0("T",row_number())) %>%
+  select(Start, DiameterBands) %>%
+  spread(Start,DiameterBands)
+
+calibration.bands <- cbind(data.table(T0=0), calibration.bands )
+
+#create final EDA calibration table
+calibration.events <- data.frame(calibration.events[,1:3], DiameterGroup = rep(calibration.bands), calibration.events[,4:7])
+
+#remove . from calibration table
+names(calibration.events) <- gsub("\\.","_", names(calibration.events))
+
+#add a column to form last col of lookup range
+calibration.events$extra <- calibration.events[,ncol(calibration.events)]
+
+#format names of calibration numbers
+names(calibration.events)[ ((ncol(calibration.events)-ncol(calibration.bands)) + 1):ncol(calibration.events)] <- paste0("EventFactor_", names(calibration.bands))
+
+
+fwrite(calibration.events, args[13])
+
+```
+
+

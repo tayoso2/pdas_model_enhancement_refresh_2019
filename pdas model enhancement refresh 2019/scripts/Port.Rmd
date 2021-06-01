@@ -1,0 +1,38 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+
+library(osmdata)
+
+#library(dplyr)
+library(tidyverse)
+library(sf)
+
+library(ggmap)
+library(leaflet)
+
+
+port <- getbb("Liverpool")%>%
+      opq()%>%
+       add_osm_feature("waterway") 
+
+port <- osmdata_sf(port)
+
+
+port = data.frame(port$osm_polygons) %>% 
+  select(id = osm_id, name, geometry) 
+
+port <- st_sf(port)
+
+library(mapview)
+mapview(port)
+
+
+
+```
+

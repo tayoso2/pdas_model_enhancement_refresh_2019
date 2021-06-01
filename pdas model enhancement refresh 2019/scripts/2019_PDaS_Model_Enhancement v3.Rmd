@@ -1,0 +1,339 @@
+---
+title: "2019 PDaS Model Enhancement"
+output:
+  word_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+  html_document:
+    number_sections: yes
+    theme: yeti
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+---
+
+```{r echo=FALSE,message=FALSE, warning = FALSE, results = 'hide'}
+#BeginHeader
+#Input#Constant#Name:Duration#Description:Number of Years of data
+#Input#DataTable#Name:Event Data - Ages#Description: Event Data - Ages
+#Input#DataTable#Name:Event Data - Assets#Description: Event Data - Assets
+#Input#DataTable#Name:Event Data - Diameters#Description: Event Data - Diameter
+#Input#DataTable#Name:Asset Base#Description: Clean Asset Base
+#Output#DataTable#Name:Diameter Analysis
+#Output#DataTable#Name:Age Relationships
+#EndHeader
+```
+
+```{r echo=FALSE,message=FALSE, warning = FALSE, results = 'hide'}
+# Install Packages
+library(tidyverse)
+library(dplyr)
+library(plyr)
+library(sf)
+library(tmap)
+library(gridExtra)
+library(data.table)
+library(modelr)
+library(knitr)
+library(ggplot2)
+library(scales)
+theme_set(theme_classic())
+
+# If running script offline set to TRUE. If in EDA set to FALSE
+offline <- TRUE
+
+# Load in Files
+if(offline == TRUE){
+  args <- c("",
+            "markdown/total_pipes.csv",
+            "markdown/nearest_blockage1.csv",
+            "markdown/pipe_sf.csv",
+            "markdown/nearest_blockage_10m_age.csv",
+            "markdown/bandedpipe_x2.csv",
+            "markdown/bandedx_10m.csv",
+            "markdown/blockage_sf.csv",
+            "markdown/blockages_sf_age.csv",
+            "Assets - Rulesets - Material Banding Table v2.csv"
+            )
+}else{
+  args <- commandArgs(trailingOnly = TRUE)
+  setwd(args[1])
+}
+pipes <- read_csv(args[2])
+blockages <- st_read(args[3])
+pipe.assets2 <- st_read(args[4])
+blockage.age <- read_csv(args[5])
+bandedpipe.x2 <- read_csv(args[6])
+bandedx.10m <- read_csv(args[7])
+blockage.sf <- read_csv(args[8])
+blockages.sf.age <- st_read(args[9])
+unband.band <- read_csv(args[10])
+```
+
+***
+
+# Method
+
+The Blockage Model predicts the number of blockages over time. This is achieved via the derivation of relationships for each material type within the asset base. The model uses a diameter failure rate (blockages/km/yr) and Age (a dimensionless multiplier (percent of blockages/percent of length)).
+
+The diameter relationships are expressed as a rate of failure, i.e. blockages/km/yr. This is achieved by grouping pipes by material with like diameters (by surface and foul/combined type) together, and calculating the number of blockages that have occurred per km on each group.
+
+The age relationship is calculated as a multiplying factor. Similar average ages (bands) are grouped, and the % length and % blockages calculated. The factor for each age band is calculated as the % blockages divided by the % length, thus creating a dimensionless ageing factor.
+
+Each relationship is derived using company specific data. To calculate the number of blockages for a given asset cohort, EDA performs the following calculation:
+ 
+$$B_a(t_0)_i =  R_i F_i L_i$$
+
+where $i$ is a series of all pipe groups
+
+* $B_a(t_0)_i$ is the characteristic event rate at time t0 based on accounted for variables (events/yr)
+* $R_i$ is the event rate corresponding to the pipe's material, surface and diameter (events/km/yr)
+* $F_i$ is the modification factor corresponding to age (dimensionless)
+* $L_i$ is the asset length (km)
+
+Therefore, as a cohort's age changes through time so does the number of blockages associated with it based on the above equation. 
+
+***
+
+# Input
+
+## Data
+
+The PDaS Blockage Model predicts the number of blockages over time. The model uses a diameter failure rate (blockages/km/yr), which is calculated for a number of diameter bands for each material used in the EDA model.
+
+The diameter rate is multiplied by an Age Factor to predict a number of blockages over time. 
+
+The PDaS asset data supplied by STW (Years 1 - 5) were combined and cleansed. This creates a PDaS survey asset base of approximately 129,000 assets of 1,866 km length.
+
+Approximately 100,000 blockages were used in the analysis, spanning a 4 year period from 1 April 2015 to 31 March 2019. These blockages are assigned to a spatial point rather than a specific asset and are thus matched where possible to the nearest PDaS asset within a 10m tolerance. Over the 4 year analysis period this method assigns 3,356 events where the rate of blockage is 0.45/km/yr.
+
+The PDaS asset data does not include the installation year of assets. Therefore, in order to analyse failures based on asset age, the installation year is infilled from the nearest public sewer, derived from spatial joining these datasets.
+
+
+## Configuration
+
+* All assets from the PDaS asset base which had been matched to a public sewer laid earlier than 1930 (according to banded diameter) were removed.
+*	To band materials the same methodology used in PR19 was applied. 
+*	Blockages assigned to PDaS assets were identified by filtering Transferred Asset to ‘Y’, and Asset Type to combined sewer, foul sewer, surface water pipe, or former S24 sewer.
+*	Where other relevant fields are missing (material, diameter, foul/combined/surface), basic infilling is used to populate the data (most common material i.e. VC, median diameter i.e. 150, and foul/combined is assumed)
+
+The current EDA model only includes Foul and Combined assets, as such, while separate relationships for Foul/Combined and Surface are derived, only the former is used in the new optimisation.
+
+***
+
+# Map View
+
+The plot below shows observed, spatially located blockages. The blockages which can be mapped to a surveyed PDaS asset are included in the above analysis.
+
+```{r echo=FALSE, fig.width=8, message=FALSE, warning=FALSE}
+## add county and age to all blocked pipes with 10m tolerance
+st_crs(blockages.sf.age) <- 27700
+tmap_mode("view")
+tm_shape(blockages.sf.age) + tm_style("beaver") + tm_dots(size = 0.01, col = "tolerance") + tm_basemap("Esri.WorldStreetMap")
+
+
+```
+
+
+***
+# Investigation Results
+
+## Diameter Analysis
+
+The diameter relationships are expressed as a rate of failure, i.e. blockages per km per year. This is achieved by grouping pipes by material, with similar diameters together, and calculating the number of incidents that have occurred per km on each group. Where insufficient blockage data exists, a group is combined with a neighbouring diameter band and a single rate is created.
+
+The table below illustrates diameter rates for foul/combined pipes of CO, PVC and VC. These are the materials which exist in the current EDA asset base.
+
+
+```{r echo=FALSE,message=FALSE, warning = FALSE}
+blockage.age <- st_as_sf(blockage.age, wkt = "WKT")
+st_crs(blockage.age) <- 27700 
+
+find_greater_equals_1 <- function(d,e,t,m,y){
+  bandedpipe.x2 <- as.data.table(bandedpipe.x2)
+  y <- as.data.table(y)
+  bandedpipe.x2$pipe_mat <- as.character(bandedpipe.x2$pipe_mat)
+  y$pipe_mat <- as.character(y$pipe_mat)
+  v <- bandedpipe.x2 %>%
+    dplyr::filter((pipe_diam <= d & pipe_mat == m & pipe_typ == t) & (pipe_diam > e & pipe_mat == m & pipe_typ == t)) %>%
+    dplyr::group_by(pipe_mat) %>%
+    dplyr::summarise(sum.l = sum(length))
+  z <- y %>%
+    dplyr::filter((pipe_diam <= d & pipe_mat == m & pipe_typ == t) & (pipe_diam > e & pipe_mat == m & pipe_typ == t)) %>%
+    dplyr::group_by(pipe_mat) %>%
+    dplyr::summarise(incidents = sum(incidents)) %>%
+    left_join(v,by = c("pipe_mat")) %>%
+    mutate(Failure.rate = (incidents/(sum.l/1000))/4) %>% 
+    mutate(Diameter = paste((e+0.1),d,sep = "-")) %>% 
+    dplyr::select(pipe_mat, Diameter,incidents,sum.l , Failure.rate) %>% 
+    dplyr::rename("TotalLength" = sum.l) %>% 
+    dplyr::rename("Material" = pipe_mat) %>% 
+    dplyr::rename("FailureRate" = Failure.rate)
+}
+a1 <- find_greater_equals_1(225,0,"C","CO",bandedx.10m)
+a2 <- find_greater_equals_1(100,0,"C","PVC",bandedx.10m)
+a3 <- find_greater_equals_1(225,100,"C","PVC",bandedx.10m)
+a4 <- find_greater_equals_1(100,0,"C","VC",bandedx.10m)
+a5 <- find_greater_equals_1(225,100,"C","VC",bandedx.10m)
+
+a.all <- rbind.data.frame(a1,a2,a3,a4,a5)
+kable(a.all, align = 'c')
+
+```
+
+
+The first plot below summarises the result of the blockages by material using the diameter values from unbanded materials. The second plot summarises the former but with banded material values and diameter bands grouped together.
+
+
+```{r echo=FALSE, fig.height=10, fig.width=10, message=FALSE, warning = FALSE}
+## RAW MATERIALS
+pipe.x22 <- pipes
+pipe.x22 <- pipe.x22[,c(1:8)]
+pipe.x22$Age <- as.numeric(as.character(pipe.x22$Age))
+blockages$length <- as.numeric(as.character(blockages$length))
+blockages$incidents <- as.numeric(as.character(blockages$incidents))
+blockages$pipe_diam <- as.numeric(as.character(blockages$pipe_diam))
+pipe.x22 <- pipe.x22 %>%  dplyr::rename("pipe_mat" = pipe_mat.x) %>% 
+  dplyr::rename("pipe_diam" = pipe_diam.x) %>% 
+  dplyr::rename("pipe_typ" = pipe_typ.x) %>% 
+  dplyr::rename("pipe_length" = length.x)
+pipe.x22$pipe_mat <- as.character(pipe.x22$pipe_mat)
+nearest.blockage.age <- merge(x=blockages, y=pipe.x22,by=c("id"))
+nearest.blockage.age$pipe_mat.x <- as.character(nearest.blockage.age$pipe_mat.x)
+pipe.x22$pipe_typ <- replace(pipe.x22$pipe_typ, pipe.x22$pipe_typ != "S", "C") #change pipe type to C or S
+nearest.blockage.age$pipe_typ.x <- replace(nearest.blockage.age$pipe_typ.x, nearest.blockage.age$pipe_typ.x != "S", "C") #change pipe type to C or S
+unbandedpipe.length <- pipe.x22 %>%
+  dplyr::filter(pipe_typ == "C") %>% 
+  dplyr::group_by(pipe_mat,pipe_diam) %>%
+  dplyr::summarise(sum.l = sum(pipe_length))
+nearest.blockage.age3 <- as.data.frame(nearest.blockage.age) %>%
+  dplyr::group_by(pipe_mat.x,pipe_diam.x,pipe_typ.x) %>%
+  dplyr::summarise(sum.incidents = sum(incidents)) %>%
+  dplyr::left_join(as.data.frame(unbandedpipe.length), by = c("pipe_mat.x"="pipe_mat",
+              "pipe_diam.x"="pipe_diam")) %>% 
+  mutate(Failure.rate = (sum.incidents/(sum.l/1000))/4)
+FR.age8 <- as.data.table(nearest.blockage.age3)
+FR.age8x <- FR.age8[-c(1),]
+FR.age9 <- FR.age8x %>%
+  dplyr::filter(pipe_typ.x == "C") %>% 
+  mutate(ProportionOfIncidents = sum.incidents/sum(sum.incidents)) %>% 
+  mutate(weighted.length = sum.l/sum(sum.l)) %>% 
+  mutate(new.Failure.rate = (ProportionOfIncidents/(weighted.length)))    
+plot98 <- ggplot(FR.age9) + 
+  geom_point(aes(x = pipe_diam.x, y = new.Failure.rate, col = pipe_mat.x)) +
+  geom_line(aes(x = pipe_diam.x, y = new.Failure.rate, col = pipe_mat.x)) + 
+  labs(title = "Diameter Rates (Unbanded)", y = "Blockage Rate (blockages/km/year)", x = "Diameter") + 
+  theme(legend.position = "bottom")
+
+#grouped materials
+bandedpipe.x2$pipe_typ <- replace(bandedpipe.x2$pipe_typ, bandedpipe.x2$pipe_typ != "S", "C") #change pipe type to C or S
+nearest.blockage.age$pipe_typ.x <- replace(nearest.blockage.age$pipe_typ.x, nearest.blockage.age$pipe_typ.x != "S", "C") #change pipe type to C or S
+bandedpipe.length <- as.data.frame(bandedpipe.x2) %>%
+  dplyr::filter(pipe_typ == "C") %>% 
+  dplyr::group_by(pipe_mat,pipe_diam) %>%
+  dplyr::summarise(sum.l = sum(length))
+bandedpipe.length <- as.data.frame(bandedpipe.length)
+banded.nearest.blockages <- nearest.blockage.age %>%
+  left_join(unique(unband.band[,c(1,2)]),by = c("pipe_mat.x"="MaterialTable_UnbandedMaterial")) %>% 
+  dplyr::mutate(pipe_mat2 = (pipe_mat = as.character(MaterialTable_BandedMaterial)))
+banded.nearest.blockages$pipe_mat.x<- NULL
+banded.nearest.blockages$MaterialTable_BandedMaterial <- NULL
+colnames(banded.nearest.blockages)[colnames(banded.nearest.blockages) == "pipe_mat2"] <- "pipe_mat"
+banded.nearest.blockages$pipe_mat <- as.character(banded.nearest.blockages$pipe_mat)
+banded.nearest.blockages$pipe_mat[banded.nearest.blockages$pipe_mat==""]<-NA
+banded.nearest.blockages$pipe_mat[which(is.na(banded.nearest.blockages$pipe_mat))] <- "Others"
+banded.nearest.blockages1 <- as.data.frame(banded.nearest.blockages) %>%
+  dplyr::group_by(pipe_mat,pipe_diam.x,pipe_typ.x) %>%
+  dplyr::summarise(sum.incidents = sum(incidents)) %>%
+  dplyr::left_join(as.data.frame(bandedpipe.length), by = c("pipe_mat"="pipe_mat",
+              "pipe_diam.x"="pipe_diam")) %>% 
+  mutate(Failure.rate = (sum.incidents/(sum.l/1000))/4)
+banded.nearest.blockages1 <- as.data.frame(banded.nearest.blockages1)
+FR.age6 <- as.data.table(banded.nearest.blockages1)
+FR.age7 <- FR.age6 %>%
+  dplyr::filter(pipe_typ.x == "C") %>% 
+  mutate(ProportionOfIncidents = sum.incidents/sum(sum.incidents)) %>% 
+  mutate(weighted.length = sum.l/sum(sum.l)) %>% 
+  mutate(new.Failure.rate = (ProportionOfIncidents/(weighted.length)))    
+plot99 <- ggplot(FR.age7) + 
+  geom_point(aes(x = pipe_diam.x, y = new.Failure.rate, col = pipe_mat)) +
+  geom_line(aes(x = pipe_diam.x, y = new.Failure.rate, col = pipe_mat)) + 
+  labs(title = "Diameter Rates (Banded)", y = "Blockage Rate (blockages/km/year)", x = "Diameter") + 
+  theme(legend.position = "bottom")
+
+grid.arrange(plot98, plot99, nrow=2)
+```
+
+## Age Analysis
+
+The age relationship is calculated as a multiplying factor. Assets are grouped into bands of similar ages. The Age Factor is calculated based on the proportion of blockages assigned to pipes of similar ages, in comparison to the proportion of the total asset base of that age. For example, an age band containing 20% of the total blockages over only 10% of the total length would be assigned an Age Factor of 2. The results of this analysis are plotted below; a line of best fit (weighted by asset length) is applied, creating a single age factor for each possible asset age.
+
+The first plot shows a very high number of blockages on young assets (<20 years of age). This is believed to be an outlier. 
+
+The second graph shows an observable deterioration relationship with assets younger than 40 years of age which were eventually clustered to obtain a relative distribution of weighted length for all ages. Based on this, the Age coefficient was calculated as 0.0053x + 0.754 (where x is the Asset Age). These values are used in EDA to simulate asset deterioration; given no proactive investment, the number of predicted blockages will increase over time.
+
+
+
+```{r echo=FALSE, fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+# generate age coefficients####
+#grouped age
+pipe.x22 <- pipes
+pipe.x22 <- pipe.x22[,c(1:8)]
+pipe.x22$Age <- as.numeric(as.character(pipe.x22$Age))
+pipe.x22 <- pipe.x22 %>%  dplyr::rename("pipe_mat" = pipe_mat.x) %>% 
+  dplyr::rename("pipe_diam" = pipe_diam.x) %>% 
+  dplyr::rename("pipe_typ" = pipe_typ.x) %>% 
+  dplyr::rename("length" = length.x)
+nearest.blockage.age <- merge(x=blockages, y=pipe.x22,by=c("id"))
+pipe.x22$pipe_typ <- replace(pipe.x22$pipe_typ, pipe.x22$pipe_typ != "S", "C")
+pipe.x22 <- pipe.x22 %>%  dplyr::filter(pipe_typ == "C")
+blockages$pipe_typ <- replace(blockages$pipe_typ, blockages$pipe_typ != "S", "C")
+blockages <- blockages %>%  dplyr::filter(pipe_typ == "C")
+nearest.blockage.age <- merge(x=blockages, y=pipe.x22,by=c("id"))
+agecoef.pipelength <- bandedpipe.x2 %>%
+  dplyr::filter(pipe_typ == "C") %>% 
+  dplyr::group_by(Age) %>%
+  dplyr::summarise(sum.l = sum(length))
+nearest.blockage.age1 <- nearest.blockage.age %>%
+  dplyr::group_by(Age) %>%
+  dplyr::summarise(sum.incidents = sum(incidents)) %>%
+  dplyr::left_join(agecoef.pipelength, by = "Age") %>% 
+  mutate(Failure.rate = (sum.incidents/(sum.l/1000))/4) %>% 
+  arrange(Age)
+## best line of fit
+FR.age1 <- nearest.blockage.age1
+FR.age1x <- FR.age1 %>%
+  mutate(ProportionOfIncidents = sum.incidents/sum(sum.incidents)) %>% 
+  mutate(weighted.length = sum.l/sum(sum.l)) %>% 
+  mutate(new.Failure.rate = (ProportionOfIncidents/(weighted.length)))    
+plot3 <- ggplot(FR.age1x, aes(x = Age, y = new.Failure.rate)) + 
+  geom_jitter(aes(size = ProportionOfIncidents)) +
+  geom_smooth(aes(weight = ProportionOfIncidents), method = "lm") + 
+  labs(title = "Deterioration Relationship", y = "Age Factor", x = "Age")
+
+
+## best line of fit
+FR.age5.1 <- nearest.blockage.age1
+FR.age5.2 <- FR.age5.1[1:4,-c(4)] %>% mutate(Age = max(Age), sum.incidents = sum(sum.incidents), sum.l = sum(sum.l)) %>%  unique()
+FR.age5.3 <- FR.age5.1[-c(1:4),-c(4)]
+FR.age5 <- rbind(FR.age5.2,FR.age5.3)
+FR.age5x <- FR.age5 %>%
+  mutate(ProportionOfIncidents = sum.incidents/sum(sum.incidents)) %>% 
+  mutate(weighted.length = sum.l/sum(sum.l)) %>% 
+  mutate(new.Failure.rate = (ProportionOfIncidents/(weighted.length)))    
+plot4 <- ggplot(FR.age5x, aes(x = Age, y = new.Failure.rate)) + 
+  geom_jitter(aes(size = ProportionOfIncidents)) +
+  geom_smooth(aes(weight = ProportionOfIncidents), method = "lm") + 
+  labs(title = "Deterioration Relationship (Grouped Age)", y = "Age Factor", x = "Age") 
+
+ 
+
+grid.arrange(plot3, plot4, nrow=2)
+```
+
+
+***
+
+
